@@ -1,0 +1,571 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+    Generator: "former2"
+Description: "IAM Users and Buckets"
+Parameters:
+    DPBucketName:
+        Type: "String"
+        Default: "patient-data"
+
+    OmicsBucketName:
+        Type: "String"
+        Default: "omics-data"
+
+    ImagesBucketName:
+        Type: "String"
+        Default: "images-data"
+
+    DPDirsToCreate:
+        Description:  "Comma delimited list of directories to create."
+        Type: CommaDelimitedList
+        Default:  "allergies,conditions,encounters,immunizations,patient_reference_data,patients,procedures"
+
+    OmicsDirsToCreate:
+        Description:  "Comma delimited list of directories to create."
+        Type: CommaDelimitedList
+        Default:  "gene_copy_number,gene_mutation"
+    ProducerUserName:
+        Type: "String"
+        Default: "dz-producer"
+
+    ConsumerUserName:
+        Type: "String"
+        Default: "dz-consumer"
+
+
+Resources:
+    Producer:
+      Type: AWS::IAM::User
+      DependsOn: ProducerCredSecret
+      Properties:
+        UserName: !Sub "{{resolve:secretsmanager:${ProducerCredSecret}::username}}"
+        LoginProfile:
+            Password: !Sub "{{resolve:secretsmanager:${ProducerCredSecret}::password}}"
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/PowerUserAccess
+          - arn:aws:iam::aws:policy/AmazonDataZoneFullAccess
+
+    ProducerCredSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        Name: 'Producer-secret'
+        Description: This is a Secrets Manager secret for a Producer
+        GenerateSecretString:
+          SecretStringTemplate: !Sub '{"username": "${ProducerUserName}"}'
+          GenerateStringKey: password
+          PasswordLength: 16
+          ExcludeCharacters: "\"'@/\\"
+
+    Consumer:
+      Type: AWS::IAM::User
+      DependsOn: ConsumerCredSecret
+      Properties:
+          UserName: !Sub "{{resolve:secretsmanager:${ConsumerCredSecret}::username}}"
+          LoginProfile:
+              Password: !Sub "{{resolve:secretsmanager:${ConsumerCredSecret}::password}}"
+          ManagedPolicyArns:
+              - arn:aws:iam::aws:policy/PowerUserAccess
+              - arn:aws:iam::aws:policy/AmazonDataZoneFullAccess
+
+    ConsumerCredSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        Name: 'Consumer-secret'
+        Description: This is a Secrets Manager secret for a Consumer
+        GenerateSecretString:
+          SecretStringTemplate: !Sub '{"username": "${ConsumerUserName}"}'
+          GenerateStringKey: password
+          PasswordLength: 16
+          ExcludeCharacters: "\"'@/\\"
+
+    DPBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+          BucketName: !Join
+            - "-"
+            - - Ref: DPBucketName
+              - !Select
+                - 0
+                - !Split
+                  - "-"
+                  - !Select
+                    - 2
+                    - !Split
+                      - "/"
+                      - !Ref "AWS::StackId"
+          PublicAccessBlockConfiguration:
+            BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+
+    OmicsBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+          BucketName: !Join
+            - "-"
+            - - Ref: OmicsBucketName
+              - !Select
+                - 0
+                - !Split
+                  - "-"
+                  - !Select
+                    - 2
+                    - !Split
+                      - "/"
+                      - !Ref "AWS::StackId"
+          PublicAccessBlockConfiguration:
+            BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+    
+    ImagesBucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+          BucketName: !Join
+            - "-"
+            - - Ref: ImagesBucketName
+              - !Select
+                - 0
+                - !Split
+                  - "-"
+                  - !Select
+                    - 2
+                    - !Split
+                      - "/"
+                      - !Ref "AWS::StackId"
+          PublicAccessBlockConfiguration:
+            BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+    
+ 
+    DPS3CustomResource:
+      Type: Custom::S3CustomResource
+      Properties:
+        ServiceToken: !GetAtt DPAWSLambdaFunction.Arn
+        dp_bucket: !Ref DPBucket
+        dirs_to_create: !Ref DPDirsToCreate
+        
+
+    DPAWSLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+          Description: "Work with S3 Buckets!"
+          FunctionName: !Sub '${AWS::StackName}-${AWS::Region}-dp-lambda'
+          Handler: index.handler
+          Role: !GetAtt AWSLambdaExecutionRole.Arn
+          Timeout: 360
+          Runtime: python3.9
+          Code:
+            ZipFile: |
+              import boto3
+              import cfnresponse
+              source_bucket = "dlateam-public-s3-bucket"
+              source_prefix = "datazone-multi-modaldemo-data/patients"
+              def handler(event, context):
+                # Init ...
+                the_event = event['RequestType']
+                print("The event is: ", str(the_event))
+                response_data = {}
+                s_3 = boto3.client('s3')
+                s3 = boto3.resource('s3')
+                # Retrieve parameters
+                #source_bucket = event['ResourceProperties']['source_bucket']
+                dp_bucket = event['ResourceProperties']['dp_bucket']
+                dirs_to_create = event['ResourceProperties']['dirs_to_create']
+                try:
+                    if the_event in ('Create', 'Update'):
+                        print("Requested folders for data products: ", str(dirs_to_create))
+                        for dir_name in dirs_to_create:
+                            print("Creating folder:", str(dir_name))
+                            s_3.put_object(Bucket=dp_bucket,
+                                            Key=(dir_name
+                                                + '/'))
+                            copy_source = {'Bucket' : source_bucket, 'Key' : (source_prefix + '/' + dir_name + '/' + dir_name + '.csv')}
+                            print("Source file :", copy_source)
+                            bucket = s3.Bucket(dp_bucket)
+                            bucket.copy(copy_source,(dir_name + '/'+ dir_name + '.csv'))
+                        
+                    elif the_event == 'Delete':
+                        print("Deleting S3 content...")
+                        b_operator = boto3.resource('s3')
+                        b_operator.Bucket(str(dp_bucket)).objects.all().delete()
+                    # Everything OK... send the signal back
+                    print("Operation successful!")
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.SUCCESS,
+                                      response_data)
+                except Exception as e:
+                    print("Operation failed...")
+                    print(str(e))
+                    response_data['Data'] = str(e)
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.FAILED,
+                                      response_data)
+    
+
+    OmicsS3CustomResource:
+      Type: Custom::S3CustomResource
+      Properties:
+        ServiceToken: !GetAtt OmicsAWSLambdaFunction.Arn
+        omics_bucket: !Ref OmicsBucket
+        images_bucket: !Ref ImagesBucket
+        dirs_to_create: !Ref OmicsDirsToCreate
+        
+
+    OmicsAWSLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+          Description: "Work with S3 Buckets!"
+          FunctionName: !Sub '${AWS::StackName}-${AWS::Region}-omics-lambda'
+          Handler: index.handler
+          Role: !GetAtt AWSLambdaExecutionRole.Arn
+          Timeout: 360
+          Runtime: python3.9
+          Code:
+            ZipFile: |
+              import boto3
+              import cfnresponse
+              source_bucket = "dlateam-public-s3-bucket"
+              source_prefix_gene_copy_number = "datazone-multi-modaldemo-data/gene_copy_number/"
+              source_prefix_gene_mutation = "datazone-multi-modaldemo-data/gene_mutation/"
+              source_prefix_image_data = "datazone-multi-modaldemo-data/image_data/"
+              target_prefix_gene_copy_number = "gene_copy_number/"
+              target_prefix_gene_mutation = "gene_mutation/"
+              target_prefix_image_data = "image_data/"
+              def handler(event, context):
+                # Init ...
+                the_event = event['RequestType']
+                print("The event is: ", str(the_event))
+                response_data = {}
+                s_3 = boto3.client('s3')
+                s3 = boto3.resource('s3')
+                # Retrieve parameters
+                omics_bucket = event['ResourceProperties']['omics_bucket']
+                images_bucket = event['ResourceProperties']['images_bucket']
+                
+                try:
+                    if the_event in ('Create', 'Update'):
+                      # copy objects for OMICS Gene Copy number
+                      old_bucket = s3.Bucket(source_bucket)
+                      new_bucket = s3.Bucket(omics_bucket)
+                      for obj in old_bucket.objects.filter(Prefix=source_prefix_gene_copy_number):
+                        old_source = {'Bucket' : source_bucket, 'Key' : obj.key}
+                        print("Source file :", old_source)
+                        new_key = target_prefix_gene_copy_number + obj.key[len(source_prefix_gene_copy_number):]
+                        new_obj = new_bucket.Object(new_key)
+                        new_obj.copy(old_source)
+
+                      # copy objects for OMICS Gene mutation
+                      old_bucket = s3.Bucket(source_bucket)
+                      new_bucket = s3.Bucket(omics_bucket)
+                      for obj in old_bucket.objects.filter(Prefix=source_prefix_gene_mutation):
+                        old_source = {'Bucket' : source_bucket, 'Key' : obj.key}
+                        print("Source file :", old_source)
+                        new_key = target_prefix_gene_mutation + obj.key[len(source_prefix_gene_mutation):]
+                        new_obj = new_bucket.Object(new_key)
+                        new_obj.copy(old_source)
+
+                      # copy objects for Image data
+                      old_bucket = s3.Bucket(source_bucket)
+                      new_bucket = s3.Bucket(images_bucket)
+                      for obj in old_bucket.objects.filter(Prefix=source_prefix_image_data):
+                        old_source = {'Bucket' : source_bucket, 'Key' : obj.key}
+                        print("Source file :", old_source)
+                        new_key = target_prefix_image_data + obj.key[len(source_prefix_image_data):]
+                        new_obj = new_bucket.Object(new_key)
+                        new_obj.copy(old_source)    
+                        
+                    elif the_event == 'Delete':
+                        print("Deleting S3 content...")
+                        b_operator = boto3.resource('s3')
+                        b_operator.Bucket(str(omics_bucket)).objects.all().delete()
+                        b_operator.Bucket(str(images_bucket)).objects.all().delete()
+                    # Everything OK... send the signal back
+                    print("Operation successful!")
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.SUCCESS,
+                                      response_data)
+                except Exception as e:
+                    print("Operation failed...")
+                    print(str(e))
+                    response_data['Data'] = str(e)
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.FAILED,
+                                      response_data)
+    
+
+
+    AWSLambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Statement:
+            - Action:
+              - sts:AssumeRole
+              Effect: Allow
+              Principal:
+                Service:
+                - lambda.amazonaws.com
+            Version: '2012-10-17'
+          Path: "/"
+          Policies:
+          - PolicyDocument:
+              Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+              Version: '2012-10-17'
+            PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-CW
+          - PolicyDocument:
+              Statement:
+              - Action:
+                - s3:ListBucket
+                - s3:GetObject
+                Effect: Allow
+                Resource:
+                - arn:aws:s3:::dlateam-public-s3-bucket/*
+                - arn:aws:s3:::dlateam-public-s3-bucket
+              Version: '2012-10-17'
+            PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-s3-source
+          - PolicyDocument:
+              Statement:
+              - Action:
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:List*
+                Effect: Allow
+                Resource:
+                - !Sub arn:aws:s3:::${DPBucket}/*
+                - !Sub arn:aws:s3:::${DPBucket}
+                - !Sub arn:aws:s3:::${OmicsBucket}/*
+                - !Sub arn:aws:s3:::${OmicsBucket}
+                - !Sub arn:aws:s3:::${ImagesBucket}/*
+                - !Sub arn:aws:s3:::${ImagesBucket}
+              Version: '2012-10-17'
+            PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-S3
+          RoleName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambdaExecutionRole
+
+    
+    AWSGlueJobRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - glue.amazonaws.com
+                  - lakeformation.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: s3-access-for-glue-crawler-for-all
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 's3:GetObject'
+                    - 's3:PutObject'
+                    - 's3:ListBucket'
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${DPBucket}'
+                    - !Sub 'arn:aws:s3:::${DPBucket}/*'
+                    - !Sub 'arn:aws:s3:::${OmicsBucket}'
+                    - !Sub 'arn:aws:s3:::${OmicsBucket}/*'
+                    - !Sub 'arn:aws:s3:::${ImagesBucket}'
+                    - !Sub 'arn:aws:s3:::${ImagesBucket}/*'
+        ManagedPolicyArns:
+          - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+        RoleName: AWSGlueServiceRole-all-data
+
+
+    
+    PatientsCrawler:
+      Type: 'AWS::Glue::Crawler'
+      Properties:
+        Name: patients_crawler
+        Role: !GetAtt AWSGlueJobRole.Arn
+        DatabaseName: 'patients_data'
+        Targets:
+          S3Targets:
+            - Path: !Ref DPBucket
+        Configuration: "{\"Version\":1.0,
+                         \"Grouping\":{\"TableLevelConfiguration\":2}}"
+        SchemaChangePolicy:
+          UpdateBehavior: UPDATE_IN_DATABASE
+          DeleteBehavior: LOG   
+
+    OmicsCrawler:
+      Type: 'AWS::Glue::Crawler'
+      Properties:
+        Name: omics_crawler
+        Role: !GetAtt AWSGlueJobRole.Arn
+        DatabaseName: 'omics_data'
+        Targets:
+          S3Targets:
+            - Path: !Ref OmicsBucket
+        Configuration: "{\"Version\":1.0,
+                         \"Grouping\":{\"TableLevelConfiguration\":2}}"
+        SchemaChangePolicy:
+          UpdateBehavior: UPDATE_IN_DATABASE
+          DeleteBehavior: LOG    
+
+    ImagesCrawler:
+      Type: 'AWS::Glue::Crawler'
+      Properties:
+        Name: images_crawler
+        Role: !GetAtt AWSGlueJobRole.Arn
+        DatabaseName: 'images_data'
+        Targets:
+          S3Targets:
+            - Path: !Ref ImagesBucket
+        Configuration: "{\"Version\":1.0,
+                         \"Grouping\":{\"TableLevelConfiguration\":2}}"
+        SchemaChangePolicy:
+          UpdateBehavior: UPDATE_IN_DATABASE
+          DeleteBehavior: LOG
+
+
+    RegisterDatalakelocation1:
+      Type: AWS::LakeFormation::Resource
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+      Properties:
+         ResourceArn: !Sub 'arn:aws:s3:::${DPBucket}'
+         RoleArn: !GetAtt AWSGlueJobRole.Arn
+         UseServiceLinkedRole: false
+
+    RegisterDatalakelocation2:
+      Type: AWS::LakeFormation::Resource
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+      Properties:
+         ResourceArn: !Sub 'arn:aws:s3:::${OmicsBucket}'
+         RoleArn: !GetAtt AWSGlueJobRole.Arn
+         UseServiceLinkedRole: false
+         
+    RegisterDatalakelocation3:
+      Type: AWS::LakeFormation::Resource
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+      Properties:
+         ResourceArn: !Sub 'arn:aws:s3:::${ImagesBucket}'
+         RoleArn: !GetAtt AWSGlueJobRole.Arn   
+         UseServiceLinkedRole: false     
+
+
+    LFDataLakeSettings:
+      Type: AWS::LakeFormation::DataLakeSettings
+      Properties:
+          Admins: 
+             - DataLakePrincipalIdentifier: !Sub 'arn:aws:iam::${AWS::AccountId}:role/WSParticipantRole'
+             - DataLakePrincipalIdentifier: !Sub 'arn:aws:iam::${AWS::AccountId}:role/WSOpsRole'
+             - DataLakePrincipalIdentifier: !Sub 'arn:aws:iam::${AWS::AccountId}:role/WSSystemRole'
+          
+
+    Datalocationspermissions1:
+      Type: AWS::LakeFormation::Permissions
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+          - RegisterDatalakelocation1
+          - RegisterDatalakelocation2
+          - RegisterDatalakelocation3
+      Properties:
+        DataLakePrincipal: 
+          DataLakePrincipalIdentifier: !GetAtt AWSGlueJobRole.Arn
+        Resource:
+          DataLocationResource:
+            S3Resource: !Sub 'arn:aws:s3:::${DPBucket}'
+        Permissions:
+             -  "DATA_LOCATION_ACCESS"
+
+    Datalocationspermissions2:
+      Type: AWS::LakeFormation::Permissions
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+          - RegisterDatalakelocation1
+          - RegisterDatalakelocation2
+          - RegisterDatalakelocation3
+      Properties:
+        DataLakePrincipal: 
+          DataLakePrincipalIdentifier: !GetAtt AWSGlueJobRole.Arn
+        Resource:
+          DataLocationResource:
+            S3Resource: !Sub 'arn:aws:s3:::${OmicsBucket}'
+        Permissions:
+             -  "DATA_LOCATION_ACCESS"
+
+
+    Datalocationspermissions3:
+      Type: AWS::LakeFormation::Permissions
+      DependsOn:
+          - DPBucket
+          - OmicsBucket
+          - ImagesBucket
+          - LFDataLakeSettings
+          - RegisterDatalakelocation1
+          - RegisterDatalakelocation2
+          - RegisterDatalakelocation3
+      Properties:
+        DataLakePrincipal: 
+          DataLakePrincipalIdentifier: !GetAtt AWSGlueJobRole.Arn
+        Resource:
+          DataLocationResource:
+            S3Resource: !Sub 'arn:aws:s3:::${ImagesBucket}'
+        Permissions:
+             -  "DATA_LOCATION_ACCESS"
+        
+        
+
+         
+
+Outputs:
+  AWSAccountID:
+    Value: !Ref "AWS::AccountId"
+  DZProducerIAMUserId:
+    Value: !Ref ProducerUserName
+  DZConsumerIAMUserId:
+    Value: !Ref ConsumerUserName   
+  PatientDataBucketName:
+    Value: !Ref DPBucket
+  GluecrawlerName:
+    Value: !Ref PatientsCrawler
+  OmicsDataBucketName:
+    Value: !Ref OmicsBucket
+  OmicsGluecrawlerName:
+    Value: !Ref OmicsCrawler
+  ImagesDataBucketName:
+    Value: !Ref ImagesBucket
+  ImagesGluecrawlerName:
+    Value: !Ref ImagesCrawler
+
+  
+  
